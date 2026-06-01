@@ -30,10 +30,26 @@ if should_typecheck:
 # Global flag for cuEquivariance availability
 SHOULD_USE_CUEQUIVARIANCE = False
 
+
+def _cuda_supports_cuequivariance_bfloat16() -> bool:
+    """Return whether the active CUDA device can compile cuEquivariance BF16 kernels."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_bf16_supported()
+    except AttributeError:
+        major, _ = torch.cuda.get_device_capability()
+        return major >= 8
+
+
 try:
     if torch.cuda.is_available():
         if _env.bool("DISABLE_CUEQUIVARIANCE", default=False):
             logger.info("cuEquivariance usage disabled via DISABLE_CUEQUIVARIANCE")
+        elif not _cuda_supports_cuequivariance_bfloat16():
+            logger.info(
+                "cuEquivariance disabled: CUDA device lacks native bfloat16 support"
+            )
         else:
             import cuequivariance_torch as cuet  # noqa: I001, F401
 
