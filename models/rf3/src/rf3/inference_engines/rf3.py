@@ -56,36 +56,6 @@ DEFAULT_RF3_METRICS_CFG = {
 }
 
 
-def _cuda_supports_bfloat16() -> bool:
-    """Return whether the active CUDA device can run native bfloat16 kernels."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_bf16_supported()
-    except AttributeError:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 8
-
-
-def _disable_bfloat16_only_inference_paths(model: torch.nn.Module) -> int:
-    """Disable RF3 inference shortcuts that require native bfloat16 support.
-
-    This changes module routing flags only; checkpoint parameters are left untouched.
-    """
-    patched = 0
-    for module in model.modules():
-        if hasattr(module, "use_cuequivariance") and module.use_cuequivariance:
-            module.use_cuequivariance = False
-            patched += 1
-        if hasattr(module, "force_bfloat16") and module.force_bfloat16:
-            module.force_bfloat16 = False
-            patched += 1
-        if hasattr(module, "use_deepspeed_evo") and module.use_deepspeed_evo:
-            module.use_deepspeed_evo = False
-            patched += 1
-    return patched
-
-
 def dump_json_compact_arrays(obj: dict, f: TextIO) -> None:
     """Dump JSON with indented structure but compact arrays (AF3 style).
 
@@ -284,7 +254,6 @@ class RF3InferenceEngine(BaseInferenceEngine):
         early_stopping_plddt_threshold: float | None = None,
         # Metrics
         metrics_cfg: dict | OmegaConf | MetricManager | str | None = "default",
-        precision: str | None = None,
         **kwargs,
     ):
         """Initialize inference engine and load model.
@@ -308,9 +277,6 @@ class RF3InferenceEngine(BaseInferenceEngine):
               - Pre-instantiated MetricManager
               - None (no metrics).
               Defaults to ``"default"``.
-          precision: Optional inference precision override. If unset, CUDA devices without
-              native bfloat16 support automatically use ``"16-mixed"`` instead of the
-              checkpoint's ``"bf16-mixed"`` trainer precision.
           **kwargs: Additional arguments passed to BaseInferenceEngine:
               - ckpt_path (PathLike, required): Path to model checkpoint.
               - seed (int | None): Random seed. If None, uses external RNG state. Defaults to ``None``.
@@ -328,26 +294,6 @@ class RF3InferenceEngine(BaseInferenceEngine):
             override_msa_dirs = []
             ranked_logger.debug(
                 "No MSA directories set (LOCAL_MSA_DIRS env var not found)"
-            )
-
-        self.disable_bfloat16_only_paths = (
-            torch.cuda.is_available() and not _cuda_supports_bfloat16()
-        )
-        trainer_overrides = dict(kwargs.pop("trainer_overrides", {}) or {})
-        if precision is not None:
-            if self.disable_bfloat16_only_paths and precision == "bf16-mixed":
-                ranked_logger.warning(
-                    "Requested bf16-mixed inference on a CUDA device without native "
-                    "bfloat16 support; using 16-mixed instead."
-                )
-                precision = "16-mixed"
-            trainer_overrides["precision"] = precision
-            self.disable_bfloat16_only_paths = precision != "bf16-mixed"
-        elif self.disable_bfloat16_only_paths:
-            trainer_overrides.setdefault("precision", "16-mixed")
-            ranked_logger.info(
-                "CUDA device does not support native bfloat16; using fp16 AMP and "
-                "disabling bfloat16-only RF3 inference kernels."
             )
 
         super().__init__(
@@ -383,7 +329,6 @@ class RF3InferenceEngine(BaseInferenceEngine):
             inference_sampler_overrides={
                 "num_timesteps": num_steps,
             },
-            trainer_overrides=trainer_overrides,
             **kwargs,
         )
 
@@ -429,16 +374,6 @@ class RF3InferenceEngine(BaseInferenceEngine):
                 self.trainer.metrics = None
 
         return cfg
-
-    def _construct_trainer(self, cfg, checkpoint=None):
-        super()._construct_trainer(cfg, checkpoint=checkpoint)
-        if self.disable_bfloat16_only_paths:
-            n_patched = _disable_bfloat16_only_inference_paths(
-                self.trainer.state["model"]
-            )
-            ranked_logger.info(
-                f"Disabled {n_patched} bfloat16-only RF3 inference paths for this GPU."
-            )
 
     def run(
         self,
