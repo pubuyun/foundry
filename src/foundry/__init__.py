@@ -35,11 +35,13 @@ def _cuda_supports_cuequivariance_bfloat16() -> bool:
     """Return whether the active CUDA device can compile cuEquivariance BF16 kernels."""
     if not torch.cuda.is_available():
         return False
+    major, _ = torch.cuda.get_device_capability()
+    if major < 8:
+        return False
     try:
         return torch.cuda.is_bf16_supported()
     except AttributeError:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 8
+        return True
 
 
 try:

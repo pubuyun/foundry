@@ -23,7 +23,7 @@ import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
 
-OLD = '''# Global flag for cuEquivariance availability
+FOUNDRY_OLD_BLOCK = '''# Global flag for cuEquivariance availability
 SHOULD_USE_CUEQUIVARIANCE = False
 
 try:
@@ -43,11 +43,7 @@ try:
             logger.info("cuEquivariance is available and will be used.")
 '''
 
-NEW = '''# Global flag for cuEquivariance availability
-SHOULD_USE_CUEQUIVARIANCE = False
-
-
-def _cuda_supports_cuequivariance_bfloat16() -> bool:
+FOUNDRY_V1_FUNC = '''def _cuda_supports_cuequivariance_bfloat16() -> bool:
     """Return whether the active CUDA device can compile cuEquivariance BF16 kernels."""
     if not torch.cuda.is_available():
         return False
@@ -56,6 +52,23 @@ def _cuda_supports_cuequivariance_bfloat16() -> bool:
     except AttributeError:
         major, _ = torch.cuda.get_device_capability()
         return major >= 8
+'''
+
+FOUNDRY_NEW_BLOCK = '''# Global flag for cuEquivariance availability
+SHOULD_USE_CUEQUIVARIANCE = False
+
+
+def _cuda_supports_cuequivariance_bfloat16() -> bool:
+    """Return whether the active CUDA device can compile cuEquivariance BF16 kernels."""
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    if major < 8:
+        return False
+    try:
+        return torch.cuda.is_bf16_supported()
+    except AttributeError:
+        return True
 
 
 try:
@@ -79,79 +92,170 @@ try:
             logger.info("cuEquivariance is available and will be used.")
 '''
 
-MARKER = "def _cuda_supports_cuequivariance_bfloat16()"
+FOUNDRY_V2_FUNC = '''def _cuda_supports_cuequivariance_bfloat16() -> bool:
+    """Return whether the active CUDA device can compile cuEquivariance BF16 kernels."""
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    if major < 8:
+        return False
+    try:
+        return torch.cuda.is_bf16_supported()
+    except AttributeError:
+        return True
+'''
+
+ATTENTION_IMPORT_OLD = '''if SHOULD_USE_CUEQUIVARIANCE:
+    import cuequivariance_torch as cuet
 
 
-def patch_file(path: pathlib.Path) -> str:
-    if not path.exists():
-        return "missing"
+class TriangleAttention(nn.Module):
+'''
 
-    text = path.read_text()
-    if MARKER in text:
-        status = "already patched"
-    elif OLD in text:
-        path.write_text(text.replace(OLD, NEW))
-        status = "patched"
-    else:
-        raise RuntimeError(
-            f"Could not find expected cuEquivariance block in {path}. "
-            "Patch this file manually or reinstall from the patched source tree."
-        )
+ATTENTION_IMPORT_NEW = '''if SHOULD_USE_CUEQUIVARIANCE:
+    import cuequivariance_torch as cuet
 
-    py_compile.compile(str(path), doraise=True)
+
+def _cuda_supports_cuequivariance_bfloat16(device: torch.device) -> bool:
+    """Return whether this CUDA device can compile cuEquivariance BF16 kernels."""
+    if device.type != "cuda":
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
+def _should_use_cuequivariance_for_tensor(tensor: torch.Tensor) -> bool:
+    return SHOULD_USE_CUEQUIVARIANCE and _cuda_supports_cuequivariance_bfloat16(
+        tensor.device
+    )
+
+
+class TriangleAttention(nn.Module):
+'''
+
+
+def clear_pycache(path: pathlib.Path) -> None:
     cache_dir = path.parent / "__pycache__"
     if cache_dir.exists():
-        for pyc in cache_dir.glob("__init__*.pyc"):
+        for pyc in cache_dir.glob(f"{path.stem}*.pyc"):
             pyc.unlink()
+
+
+def patch_foundry(path: pathlib.Path) -> str:
+    if not path.exists():
+        return "missing"
+    text = path.read_text()
+    if FOUNDRY_V2_FUNC in text:
+        status = "already patched"
+    elif FOUNDRY_V1_FUNC in text:
+        path.write_text(text.replace(FOUNDRY_V1_FUNC, FOUNDRY_V2_FUNC))
+        status = "updated"
+    elif FOUNDRY_OLD_BLOCK in text:
+        path.write_text(text.replace(FOUNDRY_OLD_BLOCK, FOUNDRY_NEW_BLOCK))
+        status = "patched"
+    else:
+        raise RuntimeError("expected cuEquivariance block not found")
+    py_compile.compile(str(path), doraise=True)
+    clear_pycache(path)
     return status
 
 
-targets: list[pathlib.Path] = []
+def patch_attention(path: pathlib.Path) -> str:
+    if not path.exists():
+        return "missing"
+    text = path.read_text()
+    original = text
+    if "_should_use_cuequivariance_for_tensor" not in text:
+        if ATTENTION_IMPORT_OLD not in text:
+            raise RuntimeError("expected cuEquivariance import block not found")
+        text = text.replace(ATTENTION_IMPORT_OLD, ATTENTION_IMPORT_NEW)
+    text = text.replace(
+        "if self.use_cuequivariance and SHOULD_USE_CUEQUIVARIANCE:",
+        "if self.use_cuequivariance and _should_use_cuequivariance_for_tensor(pair):",
+    )
+    if text == original:
+        status = "already patched"
+    else:
+        path.write_text(text)
+        status = "patched"
+    py_compile.compile(str(path), doraise=True)
+    clear_pycache(path)
+    return status
 
-spec = importlib.util.find_spec("foundry")
-active_target: pathlib.Path | None = None
-if spec and spec.origin:
-    active_target = pathlib.Path(spec.origin).resolve()
+
+def spec_origin(module: str) -> pathlib.Path | None:
+    spec = importlib.util.find_spec(module)
+    if spec and spec.origin:
+        return pathlib.Path(spec.origin).resolve()
+    return None
+
+
+targets: list[tuple[str, pathlib.Path, callable[[pathlib.Path], str], bool]] = []
+
+active_foundry = spec_origin("foundry")
+active_rf3 = spec_origin("rf3")
 
 for candidate in [
     root / "src" / "foundry" / "__init__.py",
     root / "foundry" / "src" / "foundry" / "__init__.py",
     root.parent / "foundry" / "src" / "foundry" / "__init__.py",
 ]:
-    targets.append(candidate.resolve())
-if active_target is not None:
-    targets.append(active_target)
+    targets.append(("foundry", candidate.resolve(), patch_foundry, False))
+if active_foundry is not None:
+    targets.append(("foundry", active_foundry, patch_foundry, True))
+
+for candidate in [
+    root / "models" / "rf3" / "src" / "rf3" / "model" / "layers" / "attention.py",
+    root / "foundry" / "models" / "rf3" / "src" / "rf3" / "model" / "layers" / "attention.py",
+    root.parent / "foundry" / "models" / "rf3" / "src" / "rf3" / "model" / "layers" / "attention.py",
+]:
+    targets.append(("rf3 attention", candidate.resolve(), patch_attention, False))
+if active_rf3 is not None:
+    targets.append(
+        (
+            "rf3 attention",
+            active_rf3.parent / "model" / "layers" / "attention.py",
+            patch_attention,
+            True,
+        )
+    )
 
 seen: set[pathlib.Path] = set()
 patched_any = False
-active_patched = active_target is None
+active_required = {path for _, path, _, active in targets if active}
+active_done: set[pathlib.Path] = set()
 errors: list[str] = []
-for target in targets:
+
+for label, target, patcher, active in targets:
     if target in seen:
+        if active:
+            active_done.add(target)
         continue
     seen.add(target)
     try:
-        status = patch_file(target)
+        status = patcher(target)
     except Exception as exc:
-        errors.append(f"{target}: {exc}")
+        errors.append(f"{label}: {target}: {exc}")
         continue
     if status != "missing":
         patched_any = True
-        if target == active_target:
-            active_patched = True
-        print(f"{status}: {target}")
+        if active:
+            active_done.add(target)
+        print(f"{status}: {label}: {target}")
 
 if not patched_any:
-    raise SystemExit("No foundry/__init__.py target was found to patch.")
+    raise SystemExit("No patch targets were found.")
 if errors:
     print("Patch warnings/errors:")
     for error in errors:
         print(f"  {error}")
-if not active_patched:
+missing_active = active_required - active_done
+if missing_active:
+    missing = ", ".join(str(path) for path in sorted(missing_active))
     raise SystemExit(
-        "The foundry package imported by this Python could not be patched. "
-        "Re-run with write permission for that environment, or set PYTHON to the "
-        "target environment's interpreter."
+        "The package imported by this Python could not be fully patched: "
+        f"{missing}. Re-run with write permission for that environment, or set "
+        "PYTHON to the target environment's interpreter."
     )
 
 print("RF3 Tesla T4 BF16/cuEquivariance patch installed.")

@@ -15,6 +15,20 @@ if SHOULD_USE_CUEQUIVARIANCE:
     import cuequivariance_torch as cuet
 
 
+def _cuda_supports_cuequivariance_bfloat16(device: torch.device) -> bool:
+    """Return whether this CUDA device can compile cuEquivariance BF16 kernels."""
+    if device.type != "cuda":
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
+def _should_use_cuequivariance_for_tensor(tensor: torch.Tensor) -> bool:
+    return SHOULD_USE_CUEQUIVARIANCE and _cuda_supports_cuequivariance_bfloat16(
+        tensor.device
+    )
+
+
 class TriangleAttention(nn.Module):
     """Implementation of Triangle Attention from AlphaFold3.
 
@@ -85,7 +99,7 @@ class TriangleAttention(nn.Module):
             pair = rearrange(pair, "b i j d -> b j i d")
 
         # Route to appropriate implementation
-        if self.use_cuequivariance and SHOULD_USE_CUEQUIVARIANCE:
+        if self.use_cuequivariance and _should_use_cuequivariance_for_tensor(pair):
             out = self._forward_cuequivariance(pair, bias)
         else:
             out = self._forward_vanilla(pair, bias)
@@ -235,7 +249,7 @@ class TriangleMultiplication(nn.Module):
     ) -> Float[torch.Tensor, "B N N D"]:
         """Forward pass of triangle multiplication."""
         # Route to appropriate implementation
-        if self.use_cuequivariance and SHOULD_USE_CUEQUIVARIANCE:
+        if self.use_cuequivariance and _should_use_cuequivariance_for_tensor(pair):
             return self._forward_cuequivariance(pair)
         else:
             return self._forward_vanilla(pair)
